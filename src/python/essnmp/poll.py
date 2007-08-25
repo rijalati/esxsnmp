@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import time
+import re
 from traceback import format_exception
 
 import yapsnmp
@@ -22,13 +23,13 @@ class ThriftClient(object):
         self.client = ESDB.Client(self.protocol)
         self.transport.open()
 
-class ESPollError(Exception):
+class PollError(Exception):
     pass
 
-class ESPollUnknownIfIndex(ESPollError):
+class PollUnknownIfIndex(PollError):
     pass
 
-class ESPollConfig(object):
+class ESPolldConfig(object):
     def __init__(self, file):
         self.file = file
 
@@ -52,17 +53,17 @@ class ESPollConfig(object):
             elif var == "error_email":
                 self.error_email = val
             else:
-                raise ESPollError("unknown config option: %s %s" % (var,val))
+                raise PollError("unknown config option: %s %s" % (var,val))
 
 
-def normalize_ifDescr(name):
+def remove_metachars(name):
     """remove troublesome metacharacters from ifDescr"""
     for (char,repl) in (("/", "_"), (" ", "_")):
         name = name.replace(char, repl)
     return name
 
-class ESSNMPPollCorrelator(object):
-    """polling correlators correlate an ifIndex to some other field.  this is
+class PollCorrelator(object):
+    """polling correlators correlate an oid to some other field.  this is
     typically used to generate the key needed to store the variable."""
 
     def __init__(self, session=None):
@@ -71,22 +72,43 @@ class ESSNMPPollCorrelator(object):
     def setup(self):
         raise NotImplementedError
 
-    def lookup(self, ifIndex):
+    def lookup(self, oid):
         raise NotImplementedError
 
-class ESSNMPIfDescrCorrelator(ESSNMPPollCorrelator):
+class IfDescrCorrelator(PollCorrelator):
     """correlates and ifIndex to an it's ifDescr"""
 
     def setup(self):
         self.xlate = {}
         for (var,val) in self.session.walk("ifDescr"):
-            self.xlate[var.split(".")[-1]] = normalize_ifDescr(val)
+            self.xlate[var.split(".")[-1]] = remove_metachars(val)
 
-    def lookup(self, ifIndex):
+    def lookup(self, oid, var):
+        # XXX this sucks
+        if oid.name == 'sysUpTime':
+            return 'sysUpTime'
+
+        ifIndex = var.split('.')[-1]
         try:
-            return self.xlate[ifIndex]
+            return "/".join((oid.name, self.xlate[ifIndex]))
         except:
-            raise ESPollUnknownIfIndex(ifIndex)
+            raise PollUnknownIfIndex(ifIndex)
+
+class JnxFirewallCorrelator(PollCorrelator):
+    """correlates entries in the jnxFWCounterByteCount tables to a variable
+    name"""
+
+    def __init__(self, session=None):
+        PollCorrelator.__init__(self,session)
+        self.oidex = re.compile('([^"]+)\."([^"]+)"\."([^"]+)"\.(.+)')
+
+    def setup(self):
+        pass
+
+    def lookup(self, oid, var):
+        (column, filter, counter, type) = self.oidex.search(var).groups()
+        return "/".join((type, filter, counter))
+
 
 class PollerChild(object):
     """Container for info about children of the main polling process"""
@@ -101,7 +123,7 @@ class PollerChild(object):
     def run(self):
         self.poller(self.config, self.name, self.device, self.oidset).run()
 
-class ESSNMPPollManager(object):
+class PollManager(object):
     """Starts a polling process for each device"""
 
     def __init__(self, opts, args, config):
@@ -114,8 +136,8 @@ class ESSNMPPollManager(object):
         essnmp.sql.setup_db(self.config.db_uri)
         self.db_session = sqlalchemy.create_session(essnmp.sql.vars['db'])
 
-        self.devices = self.db_session.query(essnmp.sql.Device).select_by(active=True)
-        #self.devices = self.db_session.query(essnmp.sql.Device).select_by(name="atla-cr1")
+        self.devices = self.db_session.query(essnmp.sql.Device).select(
+            "active = 't' AND end_time > 'NOW'")
 
         self.children = {}  # dict maps device name to child pid
 
@@ -154,13 +176,6 @@ class ESSNMPPollManager(object):
         else:
             setproctitle("espolld: %s" % child.name)
             child.run()
-            """try:
-                child.run()
-            except Exception, e:
-                self.log.info("%s died, pid %d" % (child.name, pid))
-                for line in format_exception(Exception, e):
-                    self.log.info(line)
-                sys.exit(1)"""
 
     def stop_polling(self, signum, frame):
         self.log.info("shutting down")
@@ -174,6 +189,17 @@ class ESSNMPPollManager(object):
         sys.exit()
 
 class Poller(object):
+    """The Poller class is the base for all pollers.
+
+    It provides a simple interface for subclasses:
+
+      begin()            -- called immediately before polling
+      collect(oid, data) -- called immediately before polling
+      finish()           -- called immediately after polling
+
+    All three methods MUST be defined by the subclass.
+
+    """
     def __init__(self, config, name, device, oidset):
         self.config = config
         self.name = name
@@ -184,6 +210,7 @@ class Poller(object):
         self.oids = self.oidset.oids
         self.running = True
 
+        self.count = 0
         self.snmp_session = yapsnmp.Session(self.device.name, version=2,
                 community=self.device.community)
 
@@ -191,9 +218,59 @@ class Poller(object):
         signal.signal(signal.SIGHUP, self.reload)
 
         self.log = get_logger("poller " + self.name)
+        self.errors = 0
+
+        self.poller_args = {}
+        if self.oidset.poller_args is not None:
+            for arg in self.oidset.poller_args.split():
+                (var,val) = arg.split('=')
+                self.poller_args[var] = val
 
     def run(self):
-        raise NotImplementedError("must implement run method")
+        while self.running:
+            self.log.debug("hello")
+            if self.time_to_poll():
+                self.log.debug("grabbing data")
+                self.next_poll += self.oidset.frequency
+                begin = time.time()
+
+                try:
+                    self.begin()
+
+                    for oid in self.oids:
+                        self.collect(oid,self.snmp_session.walk(oid.name))
+
+                    self.finish()
+
+                    self.log.debug("grabbed %d vars in %f seconds" %
+                            (self.count, time.time() - begin))
+                    self.log.debug("next %d" % self.next_poll)
+                    self.errors = 0
+                except yapsnmp.GetError, e:
+                    self.errors += 1
+                    if self.errors < 10  or self.errors % 10 == 0:
+                        self.log.error("unable to get snmp response after %d tries: %s" % (self.errors, e))
+
+            self.sleep()
+
+    def begin(self):
+        """begin is called immeditately before polling is done.  this is where
+        you should set up things and collect information needed during the
+        run."""
+
+        raise NotImplementedError("must implement begin method")
+
+    def collect(self, oid, data):
+        """collect is called for each oid in the oidset with the oid and data
+        collected for the oid from the device"""
+
+        raise NotImplementedError("must implement collect method")
+
+    def finish(self):
+        """finish is called immediately after polling is done.  any
+        finalization code should go here."""
+
+        raise NotImplementedError("must implement finish method")
 
     def stop(self, signum, frame):
         self.running = False
@@ -206,21 +283,26 @@ class Poller(object):
     def time_to_poll(self):
         return time.time() >= self.next_poll
 
+    def sleep(self):
+        delay = self.next_poll - int(time.time())
+
+        if delay >= 0:
+            time.sleep(delay)
+        else:
+            self.log.warning("poll %d seconds late" % abs(delay)) 
+
 class TSDBPoller(Poller):
     def __init__(self, config, name, device, oidset):
         Poller.__init__(self, config, name, device, oidset)
 
-        # XXX should fix TSDB to allow drilling down
         self.tsdb = tsdb.TSDB(self.config.tsdb_root)
-        try:
-            self.tsdb_set = self.tsdb.get_set(self.device.name)
-        except tsdb.TSDBSetDoesNotExistError:
-            self.tsdb_set = self.tsdb.add_set(self.device.name)
 
+        set_name = "/".join((self.device.name, self.oidset.name))
         try:
-            self.tsdb_set = self.tsdb_set.get_set(self.oidset.name)
+            self.tsdb_set = self.tsdb.get_set(set_name)
         except tsdb.TSDBSetDoesNotExistError:
-            self.tsdb_set = self.tsdb_set.add_set(self.oidset.name)
+            self.tsdb_set = self.tsdb.add_set(set_name)
+
 
 class SQLPoller(Poller):
     def __init__(self, config, name, device, oidset):
@@ -233,35 +315,28 @@ class SQLPoller(Poller):
 # XXX are the oidset, etc vars burdened with sqlalchemy goo? if so, does it
 # matter?
 #
-class IfDescrCorrelatedTSDBPoller(TSDBPoller):
-    """Polls each OID individually, correlates the ifIndex to ifDescr and
-    stores the results in the TSDBSet named after the OIDSet in a TSDBVar
-    named after the ifDescr."""
-    """Handles polling of an OIDSet for a device"""
+class CorrelatedTSDBPoller(TSDBPoller):
+    """Handles polling of an OIDSet for a device and uses a correlator to
+    determine the name of the variable to use to store values."""
     def __init__(self, config, name, device, oidset):
         TSDBPoller.__init__(self, config, name, device, oidset)
 
-        self.correlator = ESSNMPIfDescrCorrelator(self.snmp_session)
+        exec("self.correlator = %s(self.snmp_session)" %
+                self.poller_args['correlator'])
+
+        exec("self.chunk_mapper = %s" % self.poller_args['chunk_mapper'])
 
 
-    def run(self):
-        while self.running:
-            self.log.debug("hello from " + self.name)
+    def begin(self):
+        self.count = 0
+        self.correlator.setup()  # might raise a yapsnmp.GetError
 
-            self.correlator.setup()
-            if self.time_to_poll():
-                self.log.debug("grabbing data")
-                self.next_poll += self.oidset.frequency
-                begin = time.time()
-                cnt = 0
-                for oid in self.oids:
-                    vars = self.snmp_session.walk(oid.name)
-                    cnt += len(vars)
-                    self.store(oid, vars)
-                self.log.debug("grabbed %d vars in %f seconds" % (cnt, time.time() - begin))
-                self.log.debug("next %d" % self.next_poll)
+    def collect(self, oid, data):
+        self.count += len(data)
+        self.store(oid, data)
 
-            time.sleep(self.next_poll - int(time.time()))
+    def finish(self):
+        pass
 
     def store(self, oid, vars):
         ts = time.time()
@@ -269,15 +344,13 @@ class IfDescrCorrelatedTSDBPoller(TSDBPoller):
         exec("vartype = tsdb.%s" % oid.type.name)
 
         for (var,val) in vars:
-            if oid.name.startswith("if"):
-                var = self.correlator.lookup(var.split('.')[-1])
+            var = self.correlator.lookup(oid,var)
 
             try:
                 tsdb_var = self.tsdb_set.get_var(var)
             except tsdb.TSDBVarDoesNotExistError:
-                # XXX should allow the mapper to be configurable
                 tsdb_var = self.tsdb_set.add_var(var, vartype,
-                        self.oidset.frequency, tsdb.YYYYMMDDChunkMapper) 
+                        self.oidset.frequency, self.chunk_mapper)
 
             tsdb_var.insert(vartype(ts, tsdb.ROW_VALID, val))
             tsdb_var.flush() # XXX is this a good idea?
@@ -289,39 +362,26 @@ class IfRefSQLPoller(SQLPoller):
 
     def __init__(self, config, name, device, oidset):
         SQLPoller.__init__(self, config, name, device, oidset)
+        self.ifref_data = {}
 
-    def run(self):
-        while self.running:
-            self.log.debug("hello")
-            if self.time_to_poll():
-                self.log.debug("grabbing data")
-                self.next_poll += self.oidset.frequency
-                begin = time.time()
-                cnt = 0
-                ifref_data = {}
+    def begin(self):
+        self.count = 0
 
-                for oid in self.oids:
-                    ifref_data[oid.name] = self.snmp_session.walk(oid.name)
-                    cnt += len(ifref_data[oid.name])
+    def collect(self, oid, data):
+        self.ifref_data[oid.name] = data
+        self.count += len(self.ifref_data[oid.name])
 
-                self.store(ifref_data)
+    def finish(self):
+        self.store()
 
-                self.log.debug("grabbed %d vars in %f seconds" % (cnt, time.time() - begin))
-                self.log.debug("next %d" % self.next_poll)
-
-            time.sleep(self.next_poll - int(time.time()))
-
-    def store(self, ifref_data):
-        new_ifrefs = self._build_objs(ifref_data)
+    def store(self):
+        new_ifrefs = self._build_objs()
         old_ifrefs = self.db_session.query(IfRef).select(
             sqlalchemy.and_(IfRef.c.deviceid==self.device.id, IfRef.c.end_time > 'NOW')
         )
 
         # iterate through what is currently in the database
         for old_ifref in old_ifrefs:
-            import pdb
-            #pdb.set_trace()
-
             # there is an entry in new_ifrefs: has anything changed?
             if new_ifrefs.has_key(old_ifref.ifdescr):
                 new_ifref = new_ifrefs[old_ifref.ifdescr]
@@ -362,25 +422,25 @@ class IfRefSQLPoller(SQLPoller):
             setattr(i, attr, obj[attr])
         return i
 
-    def _build_objs(self, ifref_data):
+    def _build_objs(self):
         ifref_objs = {}
         ifIndex_map = {}
 
-        for name, val in ifref_data['ifDescr']:
+        for name, val in self.ifref_data['ifDescr']:
             foo, ifIndex = name.split('.')
             ifIndex_map[ifIndex] = val
             ifref_objs[val] = dict(ifdescr=val, ifindex=int(ifIndex))
 
-        for name, val in ifref_data['ipAdEntIfIndex']:
+        for name, val in self.ifref_data['ipAdEntIfIndex']:
             foo, ipAddr = name.split('.', 1)
             ifref_objs[ifIndex_map[val]]['ipaddr'] = ipAddr
 
-        remaining_oids = ifref_data.keys()
+        remaining_oids = self.ifref_data.keys()
         remaining_oids.remove('ifDescr')
         remaining_oids.remove('ipAdEntIfIndex')
 
         for oid in remaining_oids:
-            for name, val in ifref_data[oid]:
+            for name, val in self.ifref_data[oid]:
                 if oid in ('ifSpeed', 'ifHighSpeed'):
                     val = int(val)
                 foo, ifIndex = name.split('.')

@@ -220,6 +220,8 @@ class Poller(object):
         self.log = get_logger("poller " + self.name)
         self.errors = 0
 
+        self.runs = 0
+
         self.poller_args = {}
         if self.oidset.poller_args is not None:
             for arg in self.oidset.poller_args.split():
@@ -250,6 +252,13 @@ class Poller(object):
                     self.errors += 1
                     if self.errors < 10  or self.errors % 10 == 0:
                         self.log.error("unable to get snmp response after %d tries: %s" % (self.errors, e))
+
+            #
+            # XXX kludge to get around memory leak BAD BAD BAD!
+            #
+            self.runs += 1
+            if self.runs > 120:
+                sys.exit()
 
             self.sleep()
 

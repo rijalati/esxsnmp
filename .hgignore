@@ -1,0 +1,27 @@
+syntax: glob
+.svn
+tsdb-old
+tmp
+eggs
+*.pyc
+*.egg-info
+parts
+parts.old
+bin
+lib
+include
+develop-eggs
+venv
+esxsnmp.env
+.env
+esxsnmp.db
+.Python
+src
+devel/tsdb-data
+devel/var
+devel/crashlog
+docs/_build
+.DS_Store
+*.swp
+*.py.orig
+pysqlite2-doc/install-source.txt

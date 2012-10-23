@@ -1,0 +1,6 @@
+We may have a LOT of files open at any given time and during the transition
+between chunks we may have 2 * $LOTS open.  Set your system resources
+appropriately.  On FreeBSD this is done by tuning sys.maxfiles using sysctl.
+May also need to tune kern.maxfilesperproc once me move from the process per
+polling group per device model.
+

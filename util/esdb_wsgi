@@ -1,0 +1,21 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import site
+
+try:
+    ESXSNMP_ROOT = os.environ['ESXSNMP_ROOT']
+except:
+    ESXSNMP_ROOT = os.path.dirname(os.path.abspath(__file__)) + "/.."
+    os.environ['ESXSNMP_ROOT'] = ESXSNMP_ROOT
+
+if not os.environ.has_key('DJANGO_SETTINGS_MODULE'):
+    os.environ['DJANGO_SETTINGS_MODULE'] = 'esxsnmp.settings'
+
+site.addsitedir('%s/venv/lib/python%d.%d/site-packages' %
+        (ESXSNMP_ROOT, sys.version_info[0], sys.version_info[1]))
+
+import esxsnmp.newdb
+
+application = esxsnmp.newdb.esdb_wsgi("%s/esxsnmp.conf" % ESXSNMP_ROOT)

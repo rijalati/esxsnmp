@@ -554,7 +554,9 @@ class CassandraPollPersister(PollPersister):
     def __init__(self, config, qname, persistq):
         PollPersister.__init__(self, config, qname, persistq)
         self.log.debug("connecting to cassandra")
-        self.db = CASSANDRA_DB(config, clear_on_test=config.db_clear_on_testing)
+        # XXX(mmg): set logging up the right way
+        self.db = CASSANDRA_DB(config, logger=self.log, 
+                        clear_on_test=config.db_clear_on_testing)
         self.log.debug("connected to cassandra")
 
         self.tsdb = tsdb.TSDB(self.config.tsdb_root)
